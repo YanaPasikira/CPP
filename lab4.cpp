@@ -1,111 +1,148 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
-#include <aclapi.h>
+#include <process.h>
 #include <iostream>
-#include <vector>
 #include <string>
-#include <cstdio>
+#include <sstream>
+#include <json/json.h>
 
+#pragma comment(lib, "ws2_32.lib")
 using namespace std;
 
-void fileInfo(const wstring& path) {
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+struct Data {
+    int id;
+    string text;
+};
 
-    LARGE_INTEGER size;
-    GetFileSizeEx(h, &size);
-
-    FILETIME ct, at, mt;
-    GetFileTime(h, &ct, &at, &mt);
-
-    PSID owner;
-    PSECURITY_DESCRIPTOR sd;
-    GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                    &owner, NULL, NULL, NULL, &sd);
-
-    WCHAR name[256], domain[256];
-    DWORD nSize = 256, dSize = 256;
-    SID_NAME_USE use;
-    LookupAccountSidW(NULL, owner, name, &nSize, domain, &dSize, &use);
-
-    cout << "Size: " << size.QuadPart << endl;
-    cout << "Attributes: " << attrs << endl;
-    wcout << L"Owner: " << domain << L"\\" << name << endl;
-
-    CloseHandle(h);
-    LocalFree(sd);
+string serialize(const Data& d) {
+    Json::Value r;
+    r["id"] = d.id;
+    r["text"] = d.text;
+    Json::StreamWriterBuilder w;
+    return Json::writeString(w, r);
 }
 
-void cRead(const char* in, const char* out) {
-    FILE* fi = fopen(in, "rb");
-    FILE* fo = fopen(out, "wb");
-    char buf[8192];
-    size_t r;
-    while ((r = fread(buf, 1, sizeof(buf), fi)) > 0)
-        fwrite(buf, 1, r, fo);
-    fclose(fi);
-    fclose(fo);
+Data deserialize(const string& s) {
+    Json::Value r;
+    Json::CharReaderBuilder b;
+    string err;
+    stringstream ss(s);
+    Json::parseFromStream(b, ss, &r, &err);
+    return { r["id"].asInt(), r["text"].asString() };
 }
 
-void winRead(const wchar_t* in, const wchar_t* out) {
-    HANDLE fi = CreateFileW(in, GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, NULL);
-    HANDLE fo = CreateFileW(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_FLAG_NO_BUFFERING, NULL);
-
-    BYTE buf[4096];
-    DWORD r, w;
-    while (ReadFile(fi, buf, sizeof(buf), &r, NULL) && r)
-        WriteFile(fo, buf, r, &w, NULL);
-
-    CloseHandle(fi);
-    CloseHandle(fo);
-}
-
-void asyncRead(const vector<wstring>& files) {
-    vector<HANDLE> handles;
-    vector<OVERLAPPED> ovs;
-    vector<HANDLE> events;
-
-    for (auto& f : files) {
-        HANDLE h = CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
-                               OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-        OVERLAPPED ov = {};
-        ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        BYTE* buf = new BYTE[4096];
-        ReadFile(h, buf, 4096, NULL, &ov);
-
-        handles.push_back(h);
-        ovs.push_back(ov);
-        events.push_back(ov.hEvent);
+DWORD WINAPI ClientThread(LPVOID lp) {
+    SOCKET c = (SOCKET)lp;
+    char buf[1024];
+    int n = recv(c, buf, sizeof(buf), 0);
+    if (n > 0) {
+        Data d = deserialize(string(buf, n));
+        string resp = serialize({ d.id, "ACK: " + d.text });
+        send(c, resp.c_str(), resp.size(), 0);
     }
+    closesocket(c);
+    return 0;
+}
 
-    WaitForMultipleObjects(events.size(), events.data(), TRUE, INFINITE);
+void tcpServer() {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2,2), &w);
 
-    for (int i = 0; i < handles.size(); i++) {
-        DWORD r;
-        GetOverlappedResult(handles[i], &ovs[i], &r, FALSE);
-        CloseHandle(handles[i]);
-        CloseHandle(events[i]);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(54000);
+    a.sin_addr.s_addr = INADDR_ANY;
+
+    bind(s, (sockaddr*)&a, sizeof(a));
+    listen(s, SOMAXCONN);
+
+    while (true) {
+        SOCKET c = accept(s, nullptr, nullptr);
+        CreateThread(nullptr, 0, ClientThread, (LPVOID)c, 0, nullptr);
     }
 }
 
-int main() {
-    wstring path = L"test.bin";
-    fileInfo(path);
+void tcpClient() {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2,2), &w);
 
-    LARGE_INTEGER t1, t2, f;
-    QueryPerformanceFrequency(&f);
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(54000);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
 
-    QueryPerformanceCounter(&t1);
-    cRead("test.bin", "c_copy.bin");
-    QueryPerformanceCounter(&t2);
-    cout << "C IO time: " << (double)(t2.QuadPart - t1.QuadPart) / f.QuadPart << endl;
+    connect(s, (sockaddr*)&a, sizeof(a));
 
-    QueryPerformanceCounter(&t1);
-    winRead(L"test.bin", L"win_copy.bin");
-    QueryPerformanceCounter(&t2);
-    cout << "WinAPI IO time: " << (double)(t2.QuadPart - t1.QuadPart) / f.QuadPart << endl;
+    Data d{1, "Hello JSON"};
+    string msg = serialize(d);
+    send(s, msg.c_str(), msg.size(), 0);
 
-    vector<wstring> files = {L"test.bin", L"win_copy.bin"};
-    asyncRead(files);
+    char buf[1024];
+    int n = recv(s, buf, sizeof(buf), 0);
+    Data r = deserialize(string(buf, n));
+    cout << r.id << " " << r.text << endl;
+
+    closesocket(s);
+    WSACleanup();
+}
+
+void udpServer() {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2,2), &w);
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(55000);
+    a.sin_addr.s_addr = INADDR_ANY;
+    bind(s, (sockaddr*)&a, sizeof(a));
+
+    char buf[1024];
+    sockaddr_in c{};
+    int clen = sizeof(c);
+
+    while (true) {
+        int n = recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&c, &clen);
+        sendto(s, buf, n, 0, (sockaddr*)&c, clen);
+    }
+}
+
+void udpClient() {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2,2), &w);
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(55000);
+    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+
+    string msg;
+    getline(cin, msg);
+
+    sendto(s, msg.c_str(), msg.size(), 0, (sockaddr*)&a, sizeof(a));
+
+    char buf[1024];
+    int len = sizeof(a);
+    recvfrom(s, buf, sizeof(buf), 0, (sockaddr*)&a, &len);
+    cout << buf << endl;
+
+    closesocket(s);
+    WSACleanup();
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) return 0;
+
+    string mode = argv[1];
+
+    if (mode == "tcp_server") tcpServer();
+    else if (mode == "tcp_client") tcpClient();
+    else if (mode == "udp_server") udpServer();
+    else if (mode == "udp_client") udpClient();
 
     return 0;
 }
